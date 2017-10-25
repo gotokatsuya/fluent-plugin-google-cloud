@@ -351,15 +351,6 @@ module Fluent
     def configure(conf)
       super
 
-      # TODO(qingling128): Remove this warning after the support is added. Also
-      # remove the comment in the description of this configuration.
-      if @partial_success && @use_grpc
-        @log.warn 'Detected partial_success enabled while use_grpc is also' \
-                  ' enabled. The support for partial success in the gRPC path' \
-                  ' is to be added in the near future. For now the ' \
-                  ' partial_success flag will be ignored.'
-      end
-
       # If monitoring is enabled, register metrics in the default registry
       # and store metric objects for future use.
       if @enable_monitoring
@@ -583,7 +574,8 @@ module Fluent
                 type: group_level_resource.type,
                 labels: group_level_resource.labels.to_h
               ),
-              labels: labels_utf8_pairs.to_h
+              labels: labels_utf8_pairs.to_h,
+              partial_success: @partial_success
             )
             increment_successful_requests_count
             increment_ingested_entries_count(entries_count)
@@ -618,12 +610,30 @@ module Fluent
             # Cloud project.
             when GRPC::Unimplemented, # Method not found or implemented.
                  GRPC::ResourceExhausted, # Some resource has been exhausted.
-                 GRPC::Unauthenticated, # Invalid authentication credentials.
-                 GRPC::InvalidArgument, # Client specified an invalid argument.
-                 GRPC::PermissionDenied # No permission to execute operation.
+                 GRPC::Unauthenticated # Invalid authentication credentials.
               increment_dropped_entries_count(entries_count)
               @log.warn "Dropping #{entries_count} log message(s)",
                         error: error.to_s, error_code: error.code.to_s
+
+            # If partial_success is enabled, valid entries should be written
+            # even if some other entries fail due to INVALID_ARGUMENT or
+            # PERMISSION_DENIED errors. Only invalid entries will be dropped.
+            when GRPC::InvalidArgument, # Client specified an invalid argument.
+                 GRPC::PermissionDenied # No permission to execute operation.
+              error_details_map = construct_error_details_map_grpc(gax_error)
+              if error_details_map.empty?
+                increment_dropped_entries_count(entries_count)
+                @log.warn "Dropping #{entries_count} log message(s)",
+                          error_class: error.class.to_s, error: error.to_s
+              else
+                error_details_map.each do |(error_code, error_message), indexes|
+                  partial_error_count = indexes.length
+                  increment_dropped_entries_count(partial_error_count)
+                  @log.warn "Dropping #{partial_error_count} log message(s)",
+                            error_code: "google.rpc.Code[#{error_code}]",
+                            error: error_message
+                end
+              end
 
             else
               # Assume it is a problem with the request itself and don't retry.
@@ -1853,6 +1863,52 @@ module Fluent
     rescue JSON::ParserError => e
       @log.warn 'Failed to extract log entry errors from the error details:' \
                 " #{error.body}.", error: e
+      {}
+    end
+
+    # Extract a map of error details from an potentially partially successful
+    # request for gRPC. Return an empty map if @partial_success is not enabled.
+    #
+    # The keys in this map are [error_code, error_message] pairs, and the values
+    # are a list of indexes of log entries that failed due to this error.
+    #
+    # A sample error.details[0].log_entry_errors looks like:
+    # {
+    #   0 => <Google::Rpc::Status:
+    #         code: 7,
+    #         message: "User not authorized.",
+    #         details: []>,
+    #   1 => <Google::Rpc::Status:
+    #         code: 3,
+    #         message: "Log name contains illegal character :",
+    #         details: []>,
+    #   3 => <Google::Rpc::Status:
+    #         code: 3,
+    #         message: "Log name contains illegal character :",
+    #         details: []>
+    # }
+    #
+    # The ultimate map that is constructed is:
+    # {
+    #   [7, 'User not authorized.']: [0],
+    #   [3, 'Log name contains illegal character :']: [1, 3]
+    # }
+    def construct_error_details_map_grpc(gax_error)
+      return {} unless @partial_success
+      error_details_map = Hash.new { |h, k| h[k] = [] }
+
+      error_details = ensure_array(gax_error.details)
+      fail JSON::ParserError, 'The error details are empty.' if
+        error_details.empty?
+      log_entry_errors = ensure_hash(error_details[0].log_entry_errors)
+      log_entry_errors.each do |index, log_entry_error|
+        error_key = [log_entry_error[:code], log_entry_error[:message]].freeze
+        error_details_map[error_key] << index
+      end
+      error_details_map
+    rescue JSON::ParserError => e
+      @log.warn 'Failed to extract log entry errors from the error details:' \
+                " #{gax_error.details.inspect}.", error: e
       {}
     end
 
